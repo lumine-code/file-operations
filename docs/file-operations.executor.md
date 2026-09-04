@@ -40,18 +40,23 @@ type FileEffect =
   | { kind: "delete"; path: string; isDirectory: boolean };
 
 type StepResult =
-  | { status: "applied"; effects: FileEffect[]; cleanupPath?: string }
+  | {
+      status: "applied";
+      effects: FileEffect[];
+      cleanupPaths?: string[];
+    }
   | { status: "skipped"; effects: [] }
   | {
       status: "failed";
       reason: string;
       effects: FileEffect[];
       partial?: boolean;
-      cleanupPath?: string;
+      cleanupPaths?: string[];
     }
   | { status: "done"; effects: [] };
 
 type FileOperationPlan = {
+  describe(): ReadonlyArray<Readonly<{ status: "apply" | "skip" }>>;
   executeNext(options?: { signal?: AbortSignal }): Promise<StepResult>;
   dispose(): void;
 };
@@ -69,11 +74,11 @@ type FileOperationsExecutor = {
 
 Every path must be absolute. `prepare()` reads but never mutates the filesystem. It simulates the complete sequence in input order, including paths produced or removed by earlier steps, and returns the zero-based operation index when preflight fails. `overwrite` takes precedence over the corresponding `ignore` option.
 
-The plan is opaque and tied to the state observed by `prepare()`. The first `executeNext()` revalidates every baseline path read during preflight; each call then revalidates the next step immediately before mutation. A changed path fails rather than silently replanning under the caller. Calls after every step return `done`, while calls after `dispose()` or a terminal failure return `failed`.
+The plan is opaque and tied to the state observed by `prepare()`. `describe()` returns a frozen array, aligned with the input operations, whose frozen entries say only whether preflight will apply or skip each operation; it exposes no filesystem snapshots and is safe for an orchestrator to retain. The first `executeNext()` revalidates every baseline path read during preflight; each call then revalidates the next step immediately before mutation. A changed path fails rather than silently replanning under the caller. Calls after every step return `done`, while calls after `dispose()` or a terminal failure return `failed`.
 
 Create makes an empty file and creates missing parent directories. Rename preserves files, directories and symbolic links, including a case-only rename; crossing devices uses a staged copy and does not remove the source until the destination is complete. Delete treats a symbolic link as a leaf, removes an empty directory without `recursive`, and requires `recursive` for a non-empty directory.
 
-Effects describe durable logical changes, not private staging, backup or tombstone paths. A failed step sets `partial` only when at least one logical effect remains after recovery. A successful step may carry `cleanupPath` when its visible result committed but a private recovery entry could not be removed.
+Effects describe durable logical changes, not private staging, backup or tombstone paths. A failed step sets `partial` only when at least one logical effect remains after recovery. A successful or failed step may carry `cleanupPaths` when private recovery entries could not be removed; every known remaining path is reported.
 
 ## Minimal example
 

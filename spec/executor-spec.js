@@ -46,6 +46,23 @@ describe("file-operations.executor", () => {
     });
   });
 
+  it("describes apply and skip decisions without exposing mutable plan state", async () => {
+    const existing = write("existing.txt", "existing");
+    const plan = await prepare([
+      { kind: "create", path: at("created.txt") },
+      { kind: "create", path: existing, options: { ignoreIfExists: true } },
+    ]);
+
+    const description = plan.describe();
+
+    expect(description).toEqual([{ status: "apply" }, { status: "skip" }]);
+    expect(Object.isFrozen(description)).toBe(true);
+    expect(description.every(Object.isFrozen)).toBe(true);
+    expect(() => description.push({ status: "apply" })).toThrow();
+    description[0].status = "skip";
+    expect(plan.describe()).toEqual([{ status: "apply" }, { status: "skip" }]);
+  });
+
   it("returns structured preflight failures with the operation index", async () => {
     const first = at("first.txt");
     const result = await executor.prepare([
@@ -312,6 +329,173 @@ describe("file-operations.executor", () => {
     expect(fs.readFileSync(target, "utf8")).toBe("source contents");
   });
 
+  it("does not replace a destination that wins the final rename race", async () => {
+    const source = write("source.txt", "source contents");
+    const target = at("target.txt");
+    const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
+    const originalRename = fs.promises.rename.bind(fs.promises);
+    let reservationObserved = false;
+    spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
+      if (from === source && to === target) {
+        reservationObserved = fs.existsSync(target);
+        if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
+        fs.writeFileSync(target, "external");
+        const error = new Error("destination appeared");
+        error.code = "EEXIST";
+        throw error;
+      }
+      return originalRename(from, to);
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("failed");
+    expect(result.effects).toEqual([]);
+    expect(reservationObserved).toBe(true);
+    expect(fs.readFileSync(source, "utf8")).toBe("source contents");
+    expect(fs.readFileSync(target, "utf8")).toBe("external");
+  });
+
+  it("restores an EXDEV source when the published destination is replaced", async () => {
+    const source = write("source.txt", "source contents");
+    const target = at("target.txt");
+    const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
+    const originalRename = fs.promises.rename.bind(fs.promises);
+    spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
+      if (from === source && to === target) {
+        const error = new Error("cross-device");
+        error.code = "EXDEV";
+        throw error;
+      }
+      const result = await originalRename(from, to);
+      if (path.basename(from).includes(".lumine-copy-") && to === target) {
+        fs.rmSync(target, { recursive: true, force: true });
+        fs.writeFileSync(target, "external");
+      }
+      return result;
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("failed");
+    expect(result.effects).toEqual([]);
+    expect(fs.readFileSync(source, "utf8")).toBe("source contents");
+    expect(fs.readFileSync(target, "utf8")).toBe("external");
+  });
+
+  it("restores late EXDEV source writes instead of deleting them", async () => {
+    const source = write("source.txt", "source contents");
+    const target = at("target.txt");
+    const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
+    const originalRename = fs.promises.rename.bind(fs.promises);
+    spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
+      if (from === source && to === target) {
+        const error = new Error("cross-device");
+        error.code = "EXDEV";
+        throw error;
+      }
+      const result = await originalRename(from, to);
+      if (path.basename(from).includes(".lumine-copy-") && to === target) {
+        const tombstone = fs
+          .readdirSync(root)
+          .find((name) => name.includes(".source.txt.lumine-move-"));
+        fs.appendFileSync(path.join(root, tombstone), " plus late write");
+      }
+      return result;
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("failed");
+    expect(result.effects).toEqual([]);
+    expect(fs.readFileSync(source, "utf8")).toBe("source contents plus late write");
+    expect(fs.existsSync(target)).toBe(false);
+  });
+
+  it("refreshes referenced descendant identities after an EXDEV directory rename", async () => {
+    const source = at("source");
+    const target = at("target");
+    const sourceChild = write(path.join("source", "child.txt"), "child");
+    const targetChild = path.join(target, "child.txt");
+    const plan = await prepare([
+      { kind: "rename", oldPath: source, newPath: target },
+      { kind: "delete", path: targetChild },
+    ]);
+    const originalRename = fs.promises.rename.bind(fs.promises);
+    spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
+      if (from === source && to === target) {
+        const error = new Error("cross-device");
+        error.code = "EXDEV";
+        throw error;
+      }
+      return originalRename(from, to);
+    });
+
+    expect((await plan.executeNext()).status).toBe("applied");
+    expect((await plan.executeNext()).status).toBe("applied");
+    expect(fs.existsSync(sourceChild)).toBe(false);
+    expect(fs.existsSync(targetChild)).toBe(false);
+  });
+
+  it("ignores filesystem-specific directory sizes when verifying an EXDEV copy", async () => {
+    const source = at("source");
+    const target = at("target");
+    write(path.join("source", "nested", "file.txt"), "contents");
+    const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
+    const originalRename = fs.promises.rename.bind(fs.promises);
+    spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
+      if (from === source && to === target) {
+        const error = new Error("cross-device");
+        error.code = "EXDEV";
+        throw error;
+      }
+      return originalRename(from, to);
+    });
+    const originalLstat = fs.promises.lstat.bind(fs.promises);
+    spyOn(fs.promises, "lstat").and.callFake(async (filePath) => {
+      const stat = await originalLstat(filePath);
+      if (String(filePath).includes(".lumine-copy-") && stat.isDirectory()) stat.size += 8192;
+      return stat;
+    });
+
+    expect((await plan.executeNext()).status).toBe("applied");
+    expect(fs.readFileSync(path.join(target, "nested", "file.txt"), "utf8")).toBe("contents");
+  });
+
+  it("reports every EXDEV recovery entry that cleanup could not remove", async () => {
+    const source = write("source.txt", "source");
+    const target = write("target.txt", "target");
+    const plan = await prepare([
+      { kind: "rename", oldPath: source, newPath: target, options: { overwrite: true } },
+    ]);
+    const originalRename = fs.promises.rename.bind(fs.promises);
+    spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
+      if (from === source && to === target) {
+        const error = new Error("cross-device");
+        error.code = "EXDEV";
+        throw error;
+      }
+      return originalRename(from, to);
+    });
+    const originalUnlink = fs.promises.unlink.bind(fs.promises);
+    spyOn(fs.promises, "unlink").and.callFake(async (filePath) => {
+      const name = path.basename(filePath);
+      if (name.includes(".lumine-move-") || name.includes(".lumine-backup-")) {
+        throw new Error("cleanup refused");
+      }
+      return originalUnlink(filePath);
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("applied");
+    expect(result.cleanupPaths.length).toBe(2);
+    expect(result.cleanupPath).toBeUndefined();
+    expect(result.cleanupPaths.some((filePath) => filePath.includes(".lumine-move-"))).toBe(true);
+    expect(result.cleanupPaths.some((filePath) => filePath.includes(".lumine-backup-"))).toBe(true);
+    expect(result.cleanupPaths.every((filePath) => fs.existsSync(filePath))).toBe(true);
+  });
+
   it("restores an EXDEV source when copying fails", async () => {
     const source = write("source.txt", "source contents");
     const target = at("target.txt");
@@ -418,6 +602,30 @@ describe("file-operations.executor", () => {
     });
     expect(fs.existsSync(target)).toBe(false);
     expect(() => fs.lstatSync(target)).toThrow();
+  });
+
+  it("reports a committed delete when parent bookkeeping fails", async () => {
+    const target = write("target.txt", "target");
+    const plan = await prepare([{ kind: "delete", path: target }]);
+    const originalUnlink = fs.promises.unlink.bind(fs.promises);
+    let deleted = false;
+    spyOn(fs.promises, "unlink").and.callFake(async (filePath) => {
+      const result = await originalUnlink(filePath);
+      if (path.basename(filePath).includes(".lumine-delete-")) deleted = true;
+      return result;
+    });
+    const originalLstat = fs.promises.lstat.bind(fs.promises);
+    spyOn(fs.promises, "lstat").and.callFake(async (filePath) => {
+      if (deleted && filePath === root) throw new Error("bookkeeping failed");
+      return originalLstat(filePath);
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("failed");
+    expect(result.partial).toBe(true);
+    expect(result.effects).toEqual([{ kind: "delete", path: target, isDirectory: false }]);
+    expect(fs.existsSync(target)).toBe(false);
   });
 
   it("overwrites a symlink without changing its referent", async () => {
@@ -538,6 +746,51 @@ describe("file-operations.executor", () => {
     expect(fs.readFileSync(target, "utf8")).toBe("case");
   });
 
+  it("applies a case-only rename of a file created by an earlier plan step", async () => {
+    const source = at("MixedCase.txt");
+    const target = at("mixedcase.txt");
+    const plan = await prepare([
+      { kind: "create", path: source },
+      { kind: "rename", oldPath: source, newPath: target },
+    ]);
+
+    expect(plan.describe()).toEqual([{ status: "apply" }, { status: "apply" }]);
+    expect((await plan.executeNext()).status).toBe("applied");
+    expect((await plan.executeNext()).status).toBe("applied");
+    expect(fs.readdirSync(root)).toContain("mixedcase.txt");
+  });
+
+  it("reports a committed rename when post-commit bookkeeping fails", async () => {
+    const source = write("source.txt", "source");
+    const target = at("target.txt");
+    const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
+    const originalRename = fs.promises.rename.bind(fs.promises);
+    let published = false;
+    spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
+      const result = await originalRename(from, to);
+      if (from === source && to === target) published = true;
+      return result;
+    });
+    const originalLstat = fs.promises.lstat.bind(fs.promises);
+    let publishedTargetReads = 0;
+    spyOn(fs.promises, "lstat").and.callFake(async (filePath) => {
+      if (published && filePath === target && ++publishedTargetReads === 2) {
+        throw new Error("bookkeeping failed");
+      }
+      return originalLstat(filePath);
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("failed");
+    expect(result.partial).toBe(true);
+    expect(result.effects).toEqual([
+      { kind: "rename", oldPath: source, newPath: target, isDirectory: false },
+    ]);
+    expect(fs.existsSync(source)).toBe(false);
+    expect(fs.readFileSync(target, "utf8")).toBe("source");
+  });
+
   it("does not mistake distinct hard-link names for a case-only rename", async () => {
     if (process.platform === "win32") return;
     const source = write("Linked.txt", "linked");
@@ -548,6 +801,21 @@ describe("file-operations.executor", () => {
 
     expect(result.status).toBe("failed");
     expect(result.reason).toContain("already exists");
+  });
+
+  it("can overwrite a distinct hard-link name without treating its ctime change as stale", async () => {
+    const source = write("source.txt", "linked");
+    const target = at("target.txt");
+    fs.linkSync(source, target);
+    const plan = await prepare([
+      { kind: "rename", oldPath: source, newPath: target, options: { overwrite: true } },
+    ]);
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("applied");
+    expect(fs.existsSync(source)).toBe(false);
+    expect(fs.readFileSync(target, "utf8")).toBe("linked");
   });
 
   it("refuses to move a directory into itself or replace its ancestor", async () => {

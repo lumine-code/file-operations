@@ -50,18 +50,23 @@ export interface DeleteEffect {
 export type FileEffect = CreateEffect | RenameEffect | DeleteEffect;
 
 export type StepResult =
-  | { status: "applied"; effects: FileEffect[]; cleanupPath?: string }
+  | {
+      status: "applied";
+      effects: FileEffect[];
+      cleanupPaths?: string[];
+    }
   | { status: "skipped"; effects: [] }
   | {
       status: "failed";
       reason: string;
       effects: FileEffect[];
       partial?: boolean;
-      cleanupPath?: string;
+      cleanupPaths?: string[];
     }
   | { status: "done"; effects: [] };
 
 export interface FileOperationPlan {
+  describe(): ReadonlyArray<Readonly<{ status: "apply" | "skip" }>>;
   executeNext(options?: { signal?: AbortSignal }): Promise<StepResult>;
   dispose(): void;
 }
