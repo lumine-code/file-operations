@@ -28,6 +28,11 @@ export interface DeleteOperation {
 
 export type FileOperation = CreateOperation | RenameOperation | DeleteOperation;
 
+export interface FileInspection {
+  readonly path: string;
+  readonly status: "file" | "directory" | "missing";
+}
+
 export interface CreateEffect {
   kind: "create";
   path: string;
@@ -65,6 +70,31 @@ export type StepResult =
     }
   | { status: "done"; effects: [] };
 
+export interface FileEventRoot {
+  readonly path: string;
+  readonly recursive: boolean;
+}
+
+export interface FileOperationEventTrace {
+  readonly internalRoots: ReadonlyArray<Readonly<FileEventRoot>>;
+  readonly coveredRoots: ReadonlyArray<Readonly<FileEventRoot>>;
+}
+
+export interface WillExecuteStepEvent {
+  readonly id: number;
+  readonly operationIndex: number;
+  readonly operation: Readonly<FileOperation>;
+}
+
+export interface DidExecuteStepEvent extends WillExecuteStepEvent {
+  readonly result: Readonly<StepResult>;
+  readonly eventTrace: Readonly<FileOperationEventTrace>;
+}
+
+export interface Disposable {
+  dispose(): void;
+}
+
 export interface FileOperationPlan {
   describe(): ReadonlyArray<Readonly<{ status: "apply" | "skip" }>>;
   executeNext(options?: { signal?: AbortSignal }): Promise<StepResult>;
@@ -76,6 +106,12 @@ export type PrepareResult =
   | { status: "failed"; failedOperation: number; reason: string };
 
 export interface FileOperationsExecutor {
+  inspect(
+    paths: readonly string[],
+    options?: { signal?: AbortSignal },
+  ): Promise<ReadonlyArray<Readonly<FileInspection>>>;
+  onWillExecuteStep(callback: (event: WillExecuteStepEvent) => void): Disposable;
+  onDidExecuteStep(callback: (event: DidExecuteStepEvent) => void | PromiseLike<void>): Disposable;
   prepare(
     operations: readonly FileOperation[],
     options?: { signal?: AbortSignal },

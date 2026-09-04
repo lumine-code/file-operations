@@ -34,7 +34,7 @@
   },
   "providedServices": {
     "file-operations.executor": {
-      "description": "Preflight and execute ordered filesystem resource operations",
+      "description": "Inspect, preflight and execute ordered filesystem resource operations",
       "versions": {
         "1.0.0": "provideFileOperationsExecutor"
       }

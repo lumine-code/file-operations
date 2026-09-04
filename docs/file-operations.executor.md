@@ -11,7 +11,7 @@ Preflight and execute ordered filesystem resource operations without depending o
 
 ## Registration
 
-Consume `file-operations.executor` at `^1.0.0`. The service object is stateless and may be retained until the consumer is deactivated.
+Consume `file-operations.executor` at `^1.0.0`. The service object may be retained until the consumer is deactivated; dispose every lifecycle subscription when that consumer deactivates.
 
 ## Contract
 
@@ -39,6 +39,11 @@ type FileEffect =
   | { kind: "rename"; oldPath: string; newPath: string; isDirectory: boolean }
   | { kind: "delete"; path: string; isDirectory: boolean };
 
+type FileInspection = {
+  readonly path: string;
+  readonly status: "file" | "directory" | "missing";
+};
+
 type StepResult =
   | {
       status: "applied";
@@ -61,7 +66,31 @@ type FileOperationPlan = {
   dispose(): void;
 };
 
+type FileEventRoot = { readonly path: string; readonly recursive: boolean };
+
+type WillExecuteStepEvent = {
+  readonly id: number;
+  readonly operationIndex: number;
+  readonly operation: Readonly<FileOperation>;
+};
+
+type DidExecuteStepEvent = WillExecuteStepEvent & {
+  readonly result: Readonly<StepResult>;
+  readonly eventTrace: Readonly<{
+    internalRoots: ReadonlyArray<Readonly<FileEventRoot>>;
+    coveredRoots: ReadonlyArray<Readonly<FileEventRoot>>;
+  }>;
+};
+
 type FileOperationsExecutor = {
+  inspect(
+    paths: readonly string[],
+    options?: { signal?: AbortSignal },
+  ): Promise<ReadonlyArray<Readonly<FileInspection>>>;
+  onWillExecuteStep(callback: (event: WillExecuteStepEvent) => void): { dispose(): void };
+  onDidExecuteStep(callback: (event: DidExecuteStepEvent) => void | PromiseLike<void>): {
+    dispose(): void;
+  };
   prepare(
     operations: readonly FileOperation[],
     options?: { signal?: AbortSignal },
@@ -74,11 +103,17 @@ type FileOperationsExecutor = {
 
 Every path must be absolute. `prepare()` reads but never mutates the filesystem. It simulates the complete sequence in input order, including paths produced or removed by earlier steps, and returns the zero-based operation index when preflight fails. `overwrite` takes precedence over the corresponding `ignore` option.
 
+`inspect()` validates every input before reading, preserves input order and returns a frozen array of frozen entries. It uses `lstat`: real directories are `directory`, regular files and symbolic links, including dangling links and links to directories, are `file`, and `ENOENT` or `ENOTDIR` is `missing`. Invalid inputs, non-missing filesystem errors and cancellation reject the promise; cancellation uses an `AbortError` with code `ABORT_ERR`. Duplicate paths remain duplicate results.
+
 The plan is opaque and tied to the state observed by `prepare()`. `describe()` returns a frozen array, aligned with the input operations, whose frozen entries say only whether preflight will apply or skip each operation; it exposes no filesystem snapshots and is safe for an orchestrator to retain. The first `executeNext()` revalidates every baseline path read during preflight; each call then revalidates the next step immediately before mutation. A changed path fails rather than silently replanning under the caller. Calls after every step return `done`, while calls after `dispose()` or a terminal failure return `failed`.
 
 Create makes an empty file and creates missing parent directories. Rename preserves files, directories and symbolic links, including a case-only rename; crossing devices uses a staged copy and does not remove the source until the destination is complete. Delete treats a symbolic link as a leaf, removes an empty directory without `recursive`, and requires `recursive` for a non-empty directory.
 
 Effects describe durable logical changes, not private staging, backup or tombstone paths. A failed step sets `partial` only when at least one logical effect remains after recovery. A successful or failed step may carry `cleanupPaths` when private recovery entries could not be removed; every known remaining path is reported.
+
+Every actual step emits `onWillExecuteStep` synchronously before its first filesystem call and emits `onDidExecuteStep` after execution and recovery have settled. The did listeners are awaited before `executeNext()` resolves. Listener exceptions and rejected promises are logged and never alter the step result; will listeners must establish their gate synchronously because returned promises are deliberately not awaited. Disposing a subscription is idempotent. Calls that return `done`, reject concurrent execution, or target a disposed or terminal plan do not represent a step and emit neither event.
+
+Lifecycle payloads and their nested public data are frozen. `eventTrace.internalRoots` names the exact private stage, backup, tombstone and case-temporary roots claimed by the executor; `recursive` means descendants belong to that root too. `eventTrace.coveredRoots` names logical roots whose raw create/delete traffic was either replaced by the reported durable effects or safely rolled back. A path found to have been taken over by an external writer is not covered. A watcher bridge should buffer while a step is active, publish durable effects first, discard internal traffic, prevent covered create/delete events from being inferred as separate external file operations, project the effects into canonical watched-file events, and replay every remaining external event in its original order. In particular, an `updated` event beneath a recursive covered root can be external and must not be dropped merely because its path is contained by that root. The trace is not a time fence: never retain a covered logical root behind a timeout after the step settles; a late duplicate is preferable to suppressing a later external change.
 
 ## Minimal example
 

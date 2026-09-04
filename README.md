@@ -5,11 +5,13 @@ Executes ordered filesystem changes through preflighted plans.
 ## Features
 
 - **Whole-plan preflight**: validates an ordered create, rename and delete sequence against a virtual filesystem before anything changes on disk.
+- **Read-only inspection**: classifies absolute paths in one ordered, immutable batch without exposing filesystem access to consumers.
 - **Race detection**: records filesystem identities and directory listings, then rejects paths changed between planning and execution.
 - **Safe replacement**: stages creates and backs up overwritten entries so a failed publication can restore the original path.
 - **Cross-device rename**: copies through private staging paths and removes the source only after the destination has been published safely.
 - **Symlink fidelity**: treats symbolic links as leaf entries and never follows the final link during rename, overwrite or delete.
 - **Exact outcomes**: every step reports whether it applied, skipped or failed and lists only logical effects that remain visible.
+- **Watcher coordination**: brackets every executed step and reports exact internal and covered roots after recovery settles.
 
 ## Installation
 

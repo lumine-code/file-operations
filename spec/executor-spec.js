@@ -91,6 +91,128 @@ describe("file-operations.executor", () => {
     ).toBe("failed");
   });
 
+  it("inspects files, directories, missing paths and symbolic links in order", async () => {
+    const file = write("file.txt", "file");
+    const directory = at("directory");
+    const link = at("directory-link");
+    const dangling = at("dangling-link");
+    const missing = at("missing");
+    fs.mkdirSync(directory);
+    fs.symlinkSync(directory, link, process.platform === "win32" ? "junction" : "dir");
+    fs.symlinkSync("missing-target", dangling, "file");
+
+    const result = await executor.inspect([file, directory, link, dangling, missing, file]);
+
+    expect(result).toEqual([
+      { path: file, status: "file" },
+      { path: directory, status: "directory" },
+      { path: link, status: "file" },
+      { path: dangling, status: "file" },
+      { path: missing, status: "missing" },
+      { path: file, status: "file" },
+    ]);
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(result.every(Object.isFrozen)).toBe(true);
+  });
+
+  it("validates an inspection batch before reading and preserves non-missing errors", async () => {
+    const file = write("file.txt", "file");
+    const lstat = spyOn(fs.promises, "lstat").and.callThrough();
+
+    await expectAsync(executor.inspect([file, "relative.txt"])).toBeRejectedWithError(
+      /absolute path/,
+    );
+    expect(lstat).not.toHaveBeenCalled();
+
+    const failure = new Error("inspection refused");
+    failure.code = "EACCES";
+    lstat.and.rejectWith(failure);
+    await expectAsync(executor.inspect([file])).toBeRejectedWith(failure);
+    await expectAsync(executor.inspect(null)).toBeRejectedWithError(/must be an array/);
+  });
+
+  it("rejects an aborted inspection without reading", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const lstat = spyOn(fs.promises, "lstat").and.callThrough();
+
+    let failure;
+    try {
+      await executor.inspect([at("file.txt")], { signal: controller.signal });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure.name).toBe("AbortError");
+    expect(failure.code).toBe("ABORT_ERR");
+    expect(lstat).not.toHaveBeenCalled();
+  });
+
+  it("emits frozen lifecycle events before I/O and awaits did listeners", async () => {
+    const target = at("target.txt");
+    const plan = await prepare([{ kind: "create", path: target }]);
+    const lstat = spyOn(fs.promises, "lstat").and.callThrough();
+    const timeline = [];
+    let willEvent;
+    let didEvent;
+    executor.onWillExecuteStep((event) => {
+      willEvent = event;
+      timeline.push(`will:${lstat.calls.count()}`);
+    });
+    executor.onDidExecuteStep(async (event) => {
+      didEvent = event;
+      timeline.push("did:start");
+      await Promise.resolve();
+      timeline.push("did:end");
+    });
+
+    const result = await plan.executeNext();
+    timeline.push("returned");
+
+    expect(result.status).toBe("applied");
+    expect(timeline).toEqual(["will:0", "did:start", "did:end", "returned"]);
+    expect(Object.isFrozen(willEvent)).toBe(true);
+    expect(Object.isFrozen(willEvent.operation)).toBe(true);
+    expect(Object.isFrozen(didEvent)).toBe(true);
+    expect(Object.isFrozen(didEvent.result)).toBe(true);
+    expect(Object.isFrozen(didEvent.result.effects)).toBe(true);
+    expect(Object.isFrozen(didEvent.eventTrace)).toBe(true);
+    expect(Object.isFrozen(didEvent.eventTrace.internalRoots)).toBe(true);
+    expect(Object.isFrozen(didEvent.eventTrace.coveredRoots)).toBe(true);
+    expect(didEvent.operationIndex).toBe(0);
+    expect(didEvent.id).toBe(willEvent.id);
+    expect(didEvent.eventTrace.internalRoots.length).toBe(1);
+    expect(didEvent.eventTrace.internalRoots[0].path).toContain(".lumine-create-");
+    expect(didEvent.eventTrace.internalRoots[0].recursive).toBe(false);
+    expect(didEvent.eventTrace.coveredRoots).toEqual([{ path: target, recursive: false }]);
+  });
+
+  it("isolates lifecycle listener failures and supports idempotent disposal", async () => {
+    const target = at("target.txt");
+    const plan = await prepare([{ kind: "create", path: target }]);
+    spyOn(console, "error");
+    const calls = [];
+    executor.onWillExecuteStep(() => {
+      calls.push("will-failed");
+      throw new Error("will failed");
+    });
+    const disposed = executor.onWillExecuteStep(() => calls.push("disposed"));
+    disposed.dispose();
+    disposed.dispose();
+    executor.onWillExecuteStep(() => calls.push("will-ok"));
+    executor.onDidExecuteStep(async () => {
+      calls.push("did-failed");
+      throw new Error("did failed");
+    });
+    executor.onDidExecuteStep(() => calls.push("did-ok"));
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("applied");
+    expect(calls).toEqual(["will-failed", "will-ok", "did-failed", "did-ok"]);
+    expect(console.error).toHaveBeenCalledTimes(2);
+  });
+
   it("creates an empty file and its missing parent directories", async () => {
     const target = at("nested", "deeper", "file.txt");
     const plan = await prepare([{ kind: "create", path: target }]);
@@ -281,12 +403,220 @@ describe("file-operations.executor", () => {
     expect(fs.readdirSync(root)).toEqual(["target.txt"]);
   });
 
+  it("cleans and covers a destination reservation when its first lstat fails", async () => {
+    const source = write("source.txt", "source");
+    const target = at("target.txt");
+    const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
+    let didEvent;
+    executor.onDidExecuteStep((event) => (didEvent = event));
+    const originalLstat = fs.promises.lstat.bind(fs.promises);
+    let failed = false;
+    spyOn(fs.promises, "lstat").and.callFake(async (filePath) => {
+      if (!failed && filePath === target && fs.existsSync(target)) {
+        failed = true;
+        const error = new Error("reservation inspection failed");
+        error.code = "EACCES";
+        throw error;
+      }
+      return originalLstat(filePath);
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("failed");
+    expect(result.effects).toEqual([]);
+    expect(fs.readFileSync(source, "utf8")).toBe("source");
+    expect(fs.existsSync(target)).toBe(false);
+    expect(didEvent.eventTrace.internalRoots).toEqual([]);
+    expect(didEvent.eventTrace.coveredRoots).toEqual([{ path: target, recursive: false }]);
+  });
+
+  it("reports a destination reservation that stays unreadable", async () => {
+    const source = write("source.txt", "source");
+    const target = at("target.txt");
+    const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
+    const originalLstat = fs.promises.lstat.bind(fs.promises);
+    spyOn(fs.promises, "lstat").and.callFake(async (filePath) => {
+      if (filePath === target && fs.existsSync(target)) {
+        const error = new Error("reservation unreadable");
+        error.code = "EACCES";
+        throw error;
+      }
+      return originalLstat(filePath);
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("failed");
+    expect(result.partial).toBe(true);
+    expect(result.effects).toEqual([]);
+    expect(result.cleanupPaths).toEqual([target]);
+    expect(fs.readFileSync(source, "utf8")).toBe("source");
+    expect(fs.readFileSync(target, "utf8")).toBe("");
+  });
+
+  it("reports an uninspectable create stage as an internal recovery path", async () => {
+    const target = at("target.txt");
+    const plan = await prepare([{ kind: "create", path: target }]);
+    let didEvent;
+    executor.onDidExecuteStep((event) => (didEvent = event));
+    const originalOpen = fs.promises.open.bind(fs.promises);
+    spyOn(fs.promises, "open").and.callFake(async (filePath, ...args) => {
+      const handle = await originalOpen(filePath, ...args);
+      if (!path.basename(filePath).includes(".lumine-create-")) return handle;
+      return {
+        close: () => handle.close(),
+        stat: async () => {
+          throw new Error("stage inspection failed");
+        },
+      };
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("failed");
+    expect(result.effects).toEqual([]);
+    expect(result.cleanupPaths.length).toBe(1);
+    expect(result.cleanupPaths[0]).toContain(".lumine-create-");
+    expect(fs.existsSync(result.cleanupPaths[0])).toBe(true);
+    expect(didEvent.eventTrace.internalRoots).toEqual([
+      { path: result.cleanupPaths[0], recursive: false },
+    ]);
+    expect(didEvent.eventTrace.coveredRoots).toEqual([]);
+  });
+
+  it("reports a parent created before its snapshot fails", async () => {
+    const parent = at("created-parent");
+    const target = path.join(parent, "target.txt");
+    const plan = await prepare([{ kind: "create", path: target }]);
+    const originalLstat = fs.promises.lstat.bind(fs.promises);
+    let failed = false;
+    spyOn(fs.promises, "lstat").and.callFake(async (filePath) => {
+      if (!failed && filePath === parent && fs.existsSync(parent)) {
+        failed = true;
+        throw new Error("parent inspection failed");
+      }
+      return originalLstat(filePath);
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("failed");
+    expect(result.partial).toBe(true);
+    expect(result.effects).toEqual([{ kind: "create", path: parent, isDirectory: true }]);
+    expect(result.cleanupPaths).toEqual([parent]);
+    expect(fs.existsSync(parent)).toBe(true);
+    expect(fs.existsSync(target)).toBe(false);
+  });
+
+  it("reports a published create when post-commit lstat fails", async () => {
+    const target = at("target.txt");
+    const plan = await prepare([{ kind: "create", path: target }]);
+    const originalLstat = fs.promises.lstat.bind(fs.promises);
+    let failed = false;
+    spyOn(fs.promises, "lstat").and.callFake(async (filePath) => {
+      if (!failed && filePath === target && fs.existsSync(target)) {
+        failed = true;
+        throw new Error("published target inspection failed");
+      }
+      return originalLstat(filePath);
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("failed");
+    expect(result.partial).toBe(true);
+    expect(result.effects).toEqual([{ kind: "create", path: target, isDirectory: false }]);
+    expect(fs.existsSync(target)).toBe(true);
+  });
+
+  it("preserves a committed create result when its stage stays unreadable", async () => {
+    const target = at("target.txt");
+    const plan = await prepare([{ kind: "create", path: target }]);
+    const originalLstat = fs.promises.lstat.bind(fs.promises);
+    let targetFailed = false;
+    spyOn(fs.promises, "lstat").and.callFake(async (filePath) => {
+      if (path.basename(filePath).includes(".lumine-create-")) {
+        const error = new Error("stage unreadable");
+        error.code = "EACCES";
+        throw error;
+      }
+      if (!targetFailed && filePath === target && fs.existsSync(target)) {
+        targetFailed = true;
+        throw new Error("target bookkeeping failed");
+      }
+      return originalLstat(filePath);
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("failed");
+    expect(result.partial).toBe(true);
+    expect(result.effects).toEqual([{ kind: "create", path: target, isDirectory: false }]);
+    expect(result.cleanupPaths.length).toBe(1);
+    expect(result.cleanupPaths[0]).toContain(".lumine-create-");
+    expect(fs.existsSync(target)).toBe(true);
+    expect(fs.existsSync(result.cleanupPaths[0])).toBe(true);
+  });
+
+  it("reports an owned reservation that cannot be cleaned as a durable create", async () => {
+    const source = write("source.txt", "source");
+    const target = at("target.txt");
+    const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
+    const originalRename = fs.promises.rename.bind(fs.promises);
+    spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
+      if (from === source && to === target) throw new Error("publication failed");
+      return originalRename(from, to);
+    });
+    const originalUnlink = fs.promises.unlink.bind(fs.promises);
+    spyOn(fs.promises, "unlink").and.callFake(async (filePath) => {
+      if (filePath === target) throw new Error("reservation cleanup failed");
+      return originalUnlink(filePath);
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("failed");
+    expect(result.partial).toBe(true);
+    expect(result.effects).toEqual([{ kind: "create", path: target, isDirectory: false }]);
+    expect(result.cleanupPaths).toEqual([target]);
+    expect(fs.readFileSync(source, "utf8")).toBe("source");
+    expect(fs.readFileSync(target, "utf8")).toBe("");
+  });
+
+  it("reports the actual Windows reservation type after a directory publish failure", async () => {
+    if (process.platform !== "win32") return;
+    const source = at("source");
+    const target = at("target");
+    fs.mkdirSync(source);
+    const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
+    const originalRename = fs.promises.rename.bind(fs.promises);
+    spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
+      if (from === source && to === target) throw new Error("publication failed");
+      return originalRename(from, to);
+    });
+    const originalUnlink = fs.promises.unlink.bind(fs.promises);
+    spyOn(fs.promises, "unlink").and.callFake(async (filePath) => {
+      if (filePath === target) throw new Error("reservation cleanup failed");
+      return originalUnlink(filePath);
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("failed");
+    expect(result.effects).toEqual([{ kind: "create", path: target, isDirectory: false }]);
+    expect(fs.lstatSync(target).isFile()).toBe(true);
+    expect(fs.existsSync(source)).toBe(true);
+  });
+
   it("restores an overwritten rename target when publication fails", async () => {
     const source = write("source.txt", "source");
     const target = write("target.txt", "target");
     const plan = await prepare([
       { kind: "rename", oldPath: source, newPath: target, options: { overwrite: true } },
     ]);
+    let didEvent;
+    executor.onDidExecuteStep((event) => (didEvent = event));
     const originalRename = fs.promises.rename.bind(fs.promises);
     spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
       if (from === source && to === target) {
@@ -303,6 +633,10 @@ describe("file-operations.executor", () => {
     expect(result.effects).toEqual([]);
     expect(fs.readFileSync(source, "utf8")).toBe("source");
     expect(fs.readFileSync(target, "utf8")).toBe("target");
+    expect(didEvent.eventTrace.internalRoots.length).toBe(1);
+    expect(didEvent.eventTrace.internalRoots[0].path).toContain(".lumine-backup-");
+    expect(didEvent.eventTrace.internalRoots[0].recursive).toBe(false);
+    expect(didEvent.eventTrace.coveredRoots).toEqual([{ path: target, recursive: false }]);
   });
 
   it("renames across devices through a verified staged copy", async () => {
@@ -333,6 +667,8 @@ describe("file-operations.executor", () => {
     const source = write("source.txt", "source contents");
     const target = at("target.txt");
     const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
+    let didEvent;
+    executor.onDidExecuteStep((event) => (didEvent = event));
     const originalRename = fs.promises.rename.bind(fs.promises);
     let reservationObserved = false;
     spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
@@ -354,6 +690,7 @@ describe("file-operations.executor", () => {
     expect(reservationObserved).toBe(true);
     expect(fs.readFileSync(source, "utf8")).toBe("source contents");
     expect(fs.readFileSync(target, "utf8")).toBe("external");
+    expect(didEvent.eventTrace.coveredRoots).toEqual([]);
   });
 
   it("restores an EXDEV source when the published destination is replaced", async () => {
@@ -381,6 +718,42 @@ describe("file-operations.executor", () => {
     expect(result.effects).toEqual([]);
     expect(fs.readFileSync(source, "utf8")).toBe("source contents");
     expect(fs.readFileSync(target, "utf8")).toBe("external");
+  });
+
+  it("restores an EXDEV source and reports an unreadable published destination", async () => {
+    const source = write("source.txt", "source contents");
+    const target = at("target.txt");
+    const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
+    const originalRename = fs.promises.rename.bind(fs.promises);
+    let published = false;
+    spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
+      if (from === source && to === target) {
+        const error = new Error("cross-device");
+        error.code = "EXDEV";
+        throw error;
+      }
+      const result = await originalRename(from, to);
+      if (path.basename(from).includes(".lumine-copy-") && to === target) published = true;
+      return result;
+    });
+    const originalLstat = fs.promises.lstat.bind(fs.promises);
+    spyOn(fs.promises, "lstat").and.callFake(async (filePath) => {
+      if (published && filePath === target) {
+        const error = new Error("destination unreadable");
+        error.code = "EACCES";
+        throw error;
+      }
+      return originalLstat(filePath);
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("failed");
+    expect(result.partial).toBe(true);
+    expect(result.effects).toEqual([{ kind: "create", path: target, isDirectory: false }]);
+    expect(result.cleanupPaths).toContain(target);
+    expect(fs.readFileSync(source, "utf8")).toBe("source contents");
+    expect(fs.readFileSync(target, "utf8")).toBe("source contents");
   });
 
   it("restores late EXDEV source writes instead of deleting them", async () => {
@@ -468,6 +841,8 @@ describe("file-operations.executor", () => {
     const plan = await prepare([
       { kind: "rename", oldPath: source, newPath: target, options: { overwrite: true } },
     ]);
+    let didEvent;
+    executor.onDidExecuteStep((event) => (didEvent = event));
     const originalRename = fs.promises.rename.bind(fs.promises);
     spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
       if (from === source && to === target) {
@@ -494,6 +869,14 @@ describe("file-operations.executor", () => {
     expect(result.cleanupPaths.some((filePath) => filePath.includes(".lumine-move-"))).toBe(true);
     expect(result.cleanupPaths.some((filePath) => filePath.includes(".lumine-backup-"))).toBe(true);
     expect(result.cleanupPaths.every((filePath) => fs.existsSync(filePath))).toBe(true);
+    for (const cleanupPath of result.cleanupPaths) {
+      expect(didEvent.eventTrace.internalRoots).toContain({
+        path: cleanupPath,
+        recursive: false,
+      });
+    }
+    expect(didEvent.eventTrace.coveredRoots).toContain({ path: source, recursive: false });
+    expect(didEvent.eventTrace.coveredRoots).toContain({ path: target, recursive: false });
   });
 
   it("restores an EXDEV source when copying fails", async () => {
@@ -531,6 +914,8 @@ describe("file-operations.executor", () => {
     fs.mkdirSync(source);
     write(path.join("source", "nested", "file.txt"), "contents");
     const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
+    let didEvent;
+    executor.onDidExecuteStep((event) => (didEvent = event));
     const originalRename = fs.promises.rename.bind(fs.promises);
     spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
       if (from === source && to === target) {
@@ -546,6 +931,10 @@ describe("file-operations.executor", () => {
     expect(result.status).toBe("applied");
     expect(fs.readFileSync(path.join(target, "nested", "file.txt"), "utf8")).toBe("contents");
     expect(fs.existsSync(source)).toBe(false);
+    expect(didEvent.eventTrace.internalRoots.length).toBe(2);
+    expect(didEvent.eventTrace.internalRoots.every(({ recursive }) => recursive)).toBe(true);
+    expect(didEvent.eventTrace.coveredRoots).toContain({ path: source, recursive: true });
+    expect(didEvent.eventTrace.coveredRoots).toContain({ path: target, recursive: true });
   });
 
   it("preserves a dangling symbolic link during EXDEV rename", async () => {
@@ -628,6 +1017,36 @@ describe("file-operations.executor", () => {
     expect(fs.existsSync(target)).toBe(false);
   });
 
+  it("reports a moved delete tombstone when recovery paths stay unreadable", async () => {
+    const target = write("target.txt", "target");
+    const plan = await prepare([{ kind: "delete", path: target }]);
+    const originalRename = fs.promises.rename.bind(fs.promises);
+    let tombstone;
+    spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
+      const result = await originalRename(from, to);
+      if (from === target) tombstone = to;
+      return result;
+    });
+    const originalLstat = fs.promises.lstat.bind(fs.promises);
+    spyOn(fs.promises, "lstat").and.callFake(async (filePath) => {
+      if (tombstone && (filePath === tombstone || filePath === target)) {
+        const error = new Error("delete path unreadable");
+        error.code = "EACCES";
+        throw error;
+      }
+      return originalLstat(filePath);
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("failed");
+    expect(result.partial).toBe(true);
+    expect(result.effects).toEqual([{ kind: "delete", path: target, isDirectory: false }]);
+    expect(result.cleanupPaths).toEqual([tombstone]);
+    expect(fs.existsSync(target)).toBe(false);
+    expect(fs.existsSync(tombstone)).toBe(true);
+  });
+
   it("overwrites a symlink without changing its referent", async () => {
     const referent = write("referent.txt", "referent");
     const target = at("link");
@@ -692,6 +1111,8 @@ describe("file-operations.executor", () => {
     const first = write(path.join("full", "first.txt"), "first");
     write(path.join("full", "second.txt"), "second");
     const plan = await prepare([{ kind: "delete", path: directory, options: { recursive: true } }]);
+    let didEvent;
+    executor.onDidExecuteStep((event) => (didEvent = event));
     spyOn(fs.promises, "rm").and.callFake(async (target) => {
       if (path.basename(target).includes("lumine-delete")) {
         await fs.promises.unlink(path.join(target, "first.txt"));
@@ -705,6 +1126,13 @@ describe("file-operations.executor", () => {
     expect(result.status).toBe("failed");
     expect(result.partial).toBe(true);
     expect(result.effects).toEqual([{ kind: "delete", path: first, isDirectory: false }]);
+    expect(didEvent.eventTrace.internalRoots.length).toBe(1);
+    expect(didEvent.eventTrace.internalRoots[0].path).toContain(".lumine-delete-");
+    expect(didEvent.eventTrace.internalRoots[0].recursive).toBe(true);
+    expect(didEvent.eventTrace.coveredRoots).toEqual([
+      { path: directory, recursive: true },
+      { path: first, recursive: false },
+    ]);
     expect(fs.existsSync(directory)).toBe(true);
     expect(fs.existsSync(first)).toBe(false);
     expect(fs.readFileSync(path.join(directory, "second.txt"), "utf8")).toBe("second");
@@ -789,6 +1217,72 @@ describe("file-operations.executor", () => {
     ]);
     expect(fs.existsSync(source)).toBe(false);
     expect(fs.readFileSync(target, "utf8")).toBe("source");
+  });
+
+  it("reports a committed local rename when its destination stays unreadable", async () => {
+    const source = write("source.txt", "source");
+    const target = at("target.txt");
+    const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
+    const originalRename = fs.promises.rename.bind(fs.promises);
+    let published = false;
+    spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
+      const result = await originalRename(from, to);
+      if (from === source && to === target) published = true;
+      return result;
+    });
+    const originalLstat = fs.promises.lstat.bind(fs.promises);
+    spyOn(fs.promises, "lstat").and.callFake(async (filePath) => {
+      if (published && filePath === target) {
+        const error = new Error("destination unreadable");
+        error.code = "EACCES";
+        throw error;
+      }
+      return originalLstat(filePath);
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("failed");
+    expect(result.partial).toBe(true);
+    expect(result.effects).toEqual([
+      { kind: "rename", oldPath: source, newPath: target, isDirectory: false },
+    ]);
+    expect(result.cleanupPaths).toEqual([target]);
+    expect(fs.existsSync(source)).toBe(false);
+    expect(fs.readFileSync(target, "utf8")).toBe("source");
+  });
+
+  it("reports a committed case-only rename when its destination stays unreadable", async () => {
+    if (process.platform !== "win32") return;
+    const source = write("MixedCase.txt", "source");
+    const target = at("mixedcase.txt");
+    const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
+    const originalRename = fs.promises.rename.bind(fs.promises);
+    let published = false;
+    spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
+      const result = await originalRename(from, to);
+      if (path.basename(from).includes(".lumine-case-") && to === target) published = true;
+      return result;
+    });
+    const originalLstat = fs.promises.lstat.bind(fs.promises);
+    spyOn(fs.promises, "lstat").and.callFake(async (filePath) => {
+      if (published && filePath === target) {
+        const error = new Error("destination unreadable");
+        error.code = "EACCES";
+        throw error;
+      }
+      return originalLstat(filePath);
+    });
+
+    const result = await plan.executeNext();
+
+    expect(result.status).toBe("failed");
+    expect(result.partial).toBe(true);
+    expect(result.effects).toEqual([
+      { kind: "rename", oldPath: source, newPath: target, isDirectory: false },
+    ]);
+    expect(result.cleanupPaths).toEqual([target]);
+    expect(fs.readdirSync(root)).toContain("mixedcase.txt");
   });
 
   it("does not mistake distinct hard-link names for a case-only rename", async () => {
