@@ -663,24 +663,49 @@ describe("file-operations.executor", () => {
     expect(fs.readFileSync(target, "utf8")).toBe("source contents");
   });
 
-  it("does not replace a destination that wins the final rename race", async () => {
+  it("does not replace a destination that wins the final rename race after inode reuse", async () => {
     const source = write("source.txt", "source contents");
     const target = at("target.txt");
     const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
     let didEvent;
     executor.onDidExecuteStep((event) => (didEvent = event));
+    const originalOpen = fs.promises.open.bind(fs.promises);
+    let reservationIdentity;
+    spyOn(fs.promises, "open").and.callFake(async (filePath, ...args) => {
+      const handle = await originalOpen(filePath, ...args);
+      if (filePath !== target) return handle;
+      return {
+        close: () => handle.close(),
+        stat: async () => {
+          const stat = await handle.stat();
+          reservationIdentity = { dev: stat.dev, ino: stat.ino };
+          return stat;
+        },
+      };
+    });
     const originalRename = fs.promises.rename.bind(fs.promises);
     let reservationObserved = false;
+    let externalReplaced = false;
     spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
       if (from === source && to === target) {
         reservationObserved = fs.existsSync(target);
         if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
         fs.writeFileSync(target, "external");
+        externalReplaced = true;
         const error = new Error("destination appeared");
         error.code = "EEXIST";
         throw error;
       }
       return originalRename(from, to);
+    });
+    const originalLstat = fs.promises.lstat.bind(fs.promises);
+    spyOn(fs.promises, "lstat").and.callFake(async (filePath) => {
+      const stat = await originalLstat(filePath);
+      if (externalReplaced && filePath === target) {
+        stat.dev = reservationIdentity.dev;
+        stat.ino = reservationIdentity.ino;
+      }
+      return stat;
     });
 
     const result = await plan.executeNext();
@@ -693,11 +718,12 @@ describe("file-operations.executor", () => {
     expect(didEvent.eventTrace.coveredRoots).toEqual([]);
   });
 
-  it("restores an EXDEV source when the published destination is replaced", async () => {
+  it("restores an EXDEV source when an inode-reusing destination replaces the publication", async () => {
     const source = write("source.txt", "source contents");
     const target = at("target.txt");
     const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
     const originalRename = fs.promises.rename.bind(fs.promises);
+    let externalReplaced = false;
     spyOn(fs.promises, "rename").and.callFake(async (from, to) => {
       if (from === source && to === target) {
         const error = new Error("cross-device");
@@ -708,8 +734,21 @@ describe("file-operations.executor", () => {
       if (path.basename(from).includes(".lumine-copy-") && to === target) {
         fs.rmSync(target, { recursive: true, force: true });
         fs.writeFileSync(target, "external");
+        externalReplaced = true;
       }
       return result;
+    });
+    const originalLstat = fs.promises.lstat.bind(fs.promises);
+    let stagedIdentity;
+    spyOn(fs.promises, "lstat").and.callFake(async (filePath) => {
+      const stat = await originalLstat(filePath);
+      if (path.basename(filePath).includes(".lumine-copy-")) {
+        stagedIdentity = { dev: stat.dev, ino: stat.ino };
+      } else if (externalReplaced && filePath === target) {
+        stat.dev = stagedIdentity.dev;
+        stat.ino = stagedIdentity.ino;
+      }
+      return stat;
     });
 
     const result = await plan.executeNext();
