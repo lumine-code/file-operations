@@ -1,0 +1,51 @@
+{
+  "name": "file-operations",
+  "author": "lumine-code",
+  "version": "1.0.0",
+  "description": "Executes ordered filesystem changes through preflighted plans.",
+  "repository": "https://github.com/lumine-code/file-operations",
+  "bugs": {
+    "url": "https://github.com/lumine-code/file-operations/issues"
+  },
+  "keywords": [
+    "filesystem",
+    "workspace-edit",
+    "rename",
+    "transaction",
+    "toctou",
+    "resource"
+  ],
+  "license": "MIT",
+  "main": "./lib/main",
+  "types": "./lib/main.d.ts",
+  "files": [
+    "docs",
+    "lib",
+    "spec"
+  ],
+  "engines": {
+    "lumine": "^1.0.0"
+  },
+  "scripts": {
+    "test": "lumine --test spec",
+    "lint": "eslint . --max-warnings 0",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "providedServices": {
+    "file-operations.executor": {
+      "description": "Preflight and execute ordered filesystem resource operations",
+      "versions": {
+        "1.0.0": "provideFileOperationsExecutor"
+      }
+    }
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.9.1",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-n": "^18.3.0",
+    "globals": "^17.11.0",
+    "prettier": "^3.9.6"
+  }
+}
