@@ -22,7 +22,7 @@ describe("file-operations.executor", () => {
   };
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), "lumine-file-operations-"));
+    root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "lumine-file-operations-"));
     executor = new FileOperationsExecutor();
   });
 
@@ -1324,10 +1324,9 @@ describe("file-operations.executor", () => {
     expect(fs.readdirSync(root)).toContain("mixedcase.txt");
   });
 
-  it("does not mistake distinct hard-link names for a case-only rename", async () => {
-    if (process.platform === "win32") return;
-    const source = write("Linked.txt", "linked");
-    const target = at("linked.txt");
+  it("treats distinct hard-link names as a destination conflict", async () => {
+    const source = write("linked-source.txt", "linked");
+    const target = at("linked-alias.txt");
     fs.linkSync(source, target);
 
     const result = await executor.prepare([{ kind: "rename", oldPath: source, newPath: target }]);
