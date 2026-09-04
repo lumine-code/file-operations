@@ -1222,8 +1222,10 @@ describe("file-operations.executor", () => {
     ]);
 
     expect(plan.describe()).toEqual([{ status: "apply" }, { status: "apply" }]);
-    expect((await plan.executeNext()).status).toBe("applied");
-    expect((await plan.executeNext()).status).toBe("applied");
+    const createResult = await plan.executeNext();
+    expect(createResult.status).toBe("applied", createResult.reason);
+    const renameResult = await plan.executeNext();
+    expect(renameResult.status).toBe("applied", renameResult.reason);
     expect(fs.readdirSync(root)).toContain("mixedcase.txt");
   });
 
