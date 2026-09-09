@@ -30,6 +30,45 @@ describe("file-operations.executor", () => {
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   });
 
+  it("lets a document move guard reject before changing disk", async () => {
+    const source = write("source.txt", "keep");
+    executor = new FileOperationsExecutor({
+      beginFileMove() {
+        throw new Error("destination is open");
+      },
+    });
+    const plan = await prepare([{ kind: "rename", oldPath: source, newPath: at("target.txt") }]);
+    const result = await plan.executeNext();
+    expect(result.status).toBe("failed");
+    expect(result.reason).toBe("destination is open");
+    expect(result.effects).toEqual([]);
+    expect(fs.readFileSync(source, "utf8")).toBe("keep");
+    expect(fs.existsSync(at("target.txt"))).toBe(false);
+  });
+
+  it("settles the document move before announcing confirmed filesystem effects", async () => {
+    const source = write("source.txt");
+    const target = at("target.txt");
+    let confirmed;
+    executor = new FileOperationsExecutor({
+      beginFileMove(renames) {
+        expect(fs.existsSync(source)).toBe(true);
+        expect(renames).toEqual([{ oldPath: source, newPath: target, isDirectory: false }]);
+        return {
+          async complete(effects) {
+            confirmed = effects;
+          },
+        };
+      },
+    });
+    executor.onDidExecuteStep(({ result }) => expect(confirmed).toEqual(result.effects));
+    const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
+    expect((await plan.executeNext()).status).toBe("applied");
+    expect(confirmed).toEqual([
+      { kind: "rename", oldPath: source, newPath: target, isDirectory: false },
+    ]);
+  });
+
   it("exposes an opaque frozen plan and idempotent disposal", async () => {
     const plan = await prepare([]);
 
