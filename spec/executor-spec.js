@@ -46,6 +46,33 @@ describe("file-operations.executor", () => {
     expect(fs.existsSync(at("target.txt"))).toBe(false);
   });
 
+  it("waits for document move readiness before changing disk", async () => {
+    const source = write("source.txt", "keep");
+    const target = at("target.txt");
+    let release;
+    const ready = new Promise((resolve) => {
+      release = resolve;
+    });
+    let notifyStarted;
+    const started = new Promise((resolve) => {
+      notifyStarted = resolve;
+    });
+    executor = new FileOperationsExecutor({
+      beginFileMove() {
+        notifyStarted();
+        return { ready, async complete() {} };
+      },
+    });
+    const plan = await prepare([{ kind: "rename", oldPath: source, newPath: target }]);
+    const execution = plan.executeNext();
+    await started;
+    expect(fs.readFileSync(source, "utf8")).toBe("keep");
+    expect(fs.existsSync(target)).toBe(false);
+    release();
+    expect((await execution).status).toBe("applied");
+    expect(fs.readFileSync(target, "utf8")).toBe("keep");
+  });
+
   it("settles the document move before announcing confirmed filesystem effects", async () => {
     const source = write("source.txt");
     const target = at("target.txt");
