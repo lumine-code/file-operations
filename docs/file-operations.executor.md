@@ -13,6 +13,8 @@ Preflight and execute ordered filesystem resource operations without depending o
 
 Consume `file-operations.executor` at `^1.0.0`. The service object may be retained until the consumer is deactivated; dispose every lifecycle subscription when that consumer deactivates.
 
+The service and listener subscriptions are available synchronously. The filesystem executor is imported on the first `prepare()` or `inspect()` call; concurrent calls share its initialization, and a failed load can be retried. Cancellation is checked before and after the import, before filesystem access. Deactivating the provider retires its service objects and subscriptions, so an old service cannot start work in a later activation.
+
 ## Contract
 
 ```ts

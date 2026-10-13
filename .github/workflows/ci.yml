@@ -40,9 +40,16 @@ jobs:
       - run: npm pack --dry-run
 
   integration:
-    name: Lumine integration specs
-    runs-on: ubuntu-latest
+    name: Lumine integration specs on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
     env:
       LUMINE_JASMINE_REPORTER: list
     steps:
@@ -59,6 +66,7 @@ jobs:
           cache: npm
           cache-dependency-path: lumine/package-lock.json
       - name: Install Linux build and headless-display dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update || true
           sudo apt-get install -y xvfb libx11-dev libxkbfile-dev libsecret-1-dev
@@ -81,4 +89,9 @@ jobs:
       - name: Run the Jasmine spec suite
         working-directory: lumine
         timeout-minutes: 20
-        run: xvfb-run --auto-servernum npm start -- --test ../file-operations/spec
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run --auto-servernum npm start -- --test ../file-operations/spec
+          else
+            npm start -- --test ../file-operations/spec
+          fi

@@ -2,7 +2,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const FileOperationsExecutor = require("../lib/executor");
+let FileOperationsExecutor;
 
 describe("file-operations.executor", () => {
   let root;
@@ -22,6 +22,7 @@ describe("file-operations.executor", () => {
   };
 
   beforeEach(() => {
+    FileOperationsExecutor = require("../lib/executor");
     root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "lumine-file-operations-"));
     executor = new FileOperationsExecutor();
   });

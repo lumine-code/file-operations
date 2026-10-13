@@ -23,6 +23,7 @@ describe("file-operations package assets", () => {
     for (const filePath of [
       "lib/main.js",
       "lib/main.d.ts",
+      "lib/lazy-executor.js",
       "lib/executor.js",
       "docs/file-operations.executor.md",
     ]) {
