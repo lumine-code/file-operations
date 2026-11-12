@@ -46,14 +46,14 @@
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-n": "^18.5.0",
     "globals": "^17.14.0",
-    "prettier": "^3.9.10"
+    "prettier": "^3.10.0"
   },
   "overrides": {
     "eslint@^10.14.0": {
-      "minimatch": "11.0.5"
+      "minimatch": "11.0.8"
     },
     "@eslint/config-array@0.23.5": {
-      "minimatch": "11.0.5"
+      "minimatch": "11.0.8"
     }
   }
 }
